@@ -15,6 +15,6 @@ docker build -t finterly/phip-nextflow .
 And you're done! To run the pipeline, simply add `-profile docker`. 
 
 ```bash
-nextflow run main.nf -profile docker
+nextflow run processPhage.nf -profile docker
 ```
 
