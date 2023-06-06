@@ -1,15 +1,8 @@
+#!/usr/bin/env nextflow
+nextflow.enable.dsl=2
+
 // Script Parameters
-
-ref = file(params.reference)
-
-/*
-Create 'read_pairs' channel that emits for each read pair a
-tuple containing 3 elements: pair_id, R1, R2
-*/
-Channel
-    .fromFilePairs( params.reads )
-    .ifEmpty { error "Cannot find any reads matching: ${params.reads}" }
-    .set { read_pairs }
+params.refdir = "$projectDir/references"
 
 // cutadapt based quality filtering and QC
 // Filter to only reads with primer detected and trim poly-g
@@ -23,18 +16,15 @@ process cutadapt {
 		}
 
 	input:
-	set pair_id, file(reads) from read_pairs
+	tuple val(pair_id), path(reads) 
 
 	output:
-	set pair_id, file( "filtered_${pair_id}_R{1,2}.fastq.gz" ) into filtered_reads
-	file("${pair_id}.cutadapt.log")
+	tuple val(pair_id), path("filtered_${pair_id}_R{1,2}.fastq.gz"), path("${pair_id}.cutadapt.log")
 
  	conda 'bioconda::cutadapt'
 
 	script:
 	"""
-	#!/usr/bin/env bash
-
 	cutadapt \
 	    --action=trim \
         --nextseq-trim=20 \
@@ -53,30 +43,24 @@ process cutadapt {
 // bwa based alignment
 process bwa_align {
 
+	tag "bwa aligning ${pair_id}"
+	label 'big_mem'
+
 	publishDir "${params.outdir}/$pair_id"
 
 	input:
-	set pair_id, file(reads) from filtered_reads
-
-    conda 'bioconda::bwa bioconda::samtools'
+	tuple val(pair_id), path(reads), path(cutadapt_log) 
+	path refdir
 
 	output:
-	set pair_id, "${pair_id}.bam" into bam_list
-	file "${pair_id}.bam.bai"
+	tuple val(pair_id), path("${pair_id}.bam"), path("${pair_id}.bam.bai")
 
-	time '2h'
-	cpus 8
-	penv 'smp' 
-	memory '16 GB'
+	conda 'bioconda::bwa bioconda::samtools'
 
 	script:
-
 	"""
-	#!/usr/bin/env bash
-
 	# alignment
-	bwa mem -t 8 $ref ${reads} | \
-		samtools view -b -o temp.bam
+	bwa mem -t 8 $refdir/all_falciparome_targets_no_primer.fasta ${reads} | samtools view -b -o temp.bam
 
 	# sorting reads
 	samtools sort -@ 8 -o ${pair_id}.bam temp.bam
@@ -86,7 +70,6 @@ process bwa_align {
 
 	# remove intermediary bams
 	rm temp.bam
-
 	"""
 }
 
@@ -97,29 +80,25 @@ process mapping_statistics {
 	publishDir "${params.outdir}/$pair_id"
 
 	input:
-	set pair_id, file(bam) from bam_list
+	tuple val(pair_id), path(bam), path(bam_index)
 
 	output:
-	file "${pair_id}_mapping.tab"
-	file "${pair_id}_mapping.summary.tab"
-	file "${pair_id}_mapping.unfiltered.tab"
-	file "${pair_id}_mapping.unfiltered.summary.tab"
-	file "${pair_id}_mapping.semifiltered.tab"
-	file "${pair_id}_mapping.semifiltered.summary.tab"
+	path("${pair_id}_mapping.tab")
+	path("${pair_id}_mapping.summary.tab")
+	path("${pair_id}_mapping.unfiltered.tab")
+	path("${pair_id}_mapping.unfiltered.summary.tab")
+	path("${pair_id}_mapping.semifiltered.tab")
+	path("${pair_id}_mapping.semifiltered.summary.tab")
 
  	conda 'bioconda::samtools'
 
-	time '1h'
-	cpus '1'
-	memory '8 GB'
+	errorStrategy { task.exitStatus=1 ? 'ignore' : 'terminate' }
+	//validExitStatus 0,1
 
-	validExitStatus 0,1
+	// require mapped in proper pair, and first in the pair
 
 	script:
-
 	"""
-	#!/usr/bin/env bash
-	
 	( samtools view -F 2304 ${bam} | \
 		cut -f 3,6  | \
 		grep -e "[IDSH*]" -v >> ${pair_id}_mapping.tab && \
@@ -140,5 +119,26 @@ process mapping_statistics {
 	( echo "#${pair_id} had no good reads!" > ${pair_id}_mapping.semifiltered.tab && \
 	echo "#${pair_id} had no good reads!" > ${pair_id}_mapping.semifiltered.summary.tab )
 	"""
+}
+
+workflow {
+	/*
+	Create 'read_pairs' channel that emits for each read pair a
+	tuple containing 3 elements: pair_id, R1, R2
+	*/
+	Channel
+        .fromFilePairs(params.reads, checkIfExists: true)
+		.set{read_pairs_ch}
+		//.ifEmpty{error "Cannot find any reads matching: ${params.reads}"}
+
+    // cutadapt reads
+    filtered_reads_ch = cutadapt(read_pairs_ch)
+
+	// bwa align 
+	bam_list_ch = bwa_align(filtered_reads_ch, params.refdir)
+
+	// target mapping stats
+	mapping_stats = mapping_statistics(bam_list_ch)
 
 }
+
